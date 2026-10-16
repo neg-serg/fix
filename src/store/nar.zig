@@ -38,9 +38,24 @@ pub fn serializeReport(
     filter: ?Filter,
     unsupported: ?*Unsupported,
 ) ![]u8 {
+    return serializeCapped(allocator, files, path, filter, unsupported, FileCache.max_read_bytes);
+}
+
+/// `serializeReport` with the read cap spelled out. Files above the cap stream
+/// through the writer (see `writeFileContents`), so the threshold is a parameter
+/// rather than a constant read deep inside the serializer — a test (or a future
+/// option) can exercise the streaming branch without moving the cache's cap.
+fn serializeCapped(
+    allocator: std.mem.Allocator,
+    files: *FileCache,
+    path: []const u8,
+    filter: ?Filter,
+    unsupported: ?*Unsupported,
+    read_cap: usize,
+) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(allocator);
     errdefer out.deinit();
-    try writeArchive(allocator, files, &out.writer, path, filter, unsupported);
+    try writeArchive(allocator, files, &out.writer, path, filter, unsupported, read_cap);
     return out.toOwnedSlice();
 }
 
@@ -51,6 +66,7 @@ fn writeArchive(
     path: []const u8,
     filter: ?Filter,
     unsupported: ?*Unsupported,
+    read_cap: usize,
 ) !void {
     try writeString(writer, "nix-archive-1");
     // Nix resolves the *root* source object before serializing: a top-level
@@ -59,7 +75,7 @@ fn writeArchive(
     // as directory entries are still serialized as symlink nodes (below).
     const root = try resolveRootSymlink(allocator, files, path);
     defer allocator.free(root);
-    try writeNode(allocator, files, writer, root, filter, unsupported);
+    try writeNode(allocator, files, writer, root, filter, unsupported, read_cap);
 }
 
 /// Follow a chain of symlinks at the *root* of a source path, returning the
@@ -123,7 +139,7 @@ pub fn hashPathDigestFiltered(
 ) ![std.crypto.hash.sha2.Sha256.digest_length]u8 {
     const Sha256 = @import("base").sha256.Sha256;
     var hashing: std.Io.Writer.Hashing(Sha256) = .init(&.{});
-    try writeArchive(allocator, files, &hashing.writer, path, filter, null);
+    try writeArchive(allocator, files, &hashing.writer, path, filter, null, FileCache.max_read_bytes);
     try hashing.writer.flush();
     var digest: [Sha256.digest_length]u8 = undefined;
     hashing.hasher.final(&digest);
@@ -138,7 +154,7 @@ pub fn hashSerialized(allocator: std.mem.Allocator, nar_bytes: []const u8) ![]u8
     return allocator.dupe(u8, &encoded);
 }
 
-fn writeNode(allocator: std.mem.Allocator, files: *FileCache, writer: *std.Io.Writer, path: []const u8, filter: ?Filter, unsupported: ?*Unsupported) !void {
+fn writeNode(allocator: std.mem.Allocator, files: *FileCache, writer: *std.Io.Writer, path: []const u8, filter: ?Filter, unsupported: ?*Unsupported, read_cap: usize) !void {
     try writeString(writer, "(");
     switch (try files.fileType(path)) {
         .regular => {
@@ -149,7 +165,7 @@ fn writeNode(allocator: std.mem.Allocator, files: *FileCache, writer: *std.Io.Wr
                 try writeString(writer, "");
             }
             try writeString(writer, "contents");
-            try writeString(writer, try files.readFile(path));
+            try writeFileContents(files, writer, path, read_cap);
         },
         .directory => {
             try writeString(writer, "type");
@@ -172,7 +188,7 @@ fn writeNode(allocator: std.mem.Allocator, files: *FileCache, writer: *std.Io.Wr
                 try writeString(writer, "name");
                 try writeString(writer, entry.name);
                 try writeString(writer, "node");
-                try writeNode(allocator, files, writer, child, filter, unsupported);
+                try writeNode(allocator, files, writer, child, filter, unsupported, read_cap);
                 try writeString(writer, ")");
             }
         },
@@ -192,6 +208,44 @@ fn writeNode(allocator: std.mem.Allocator, files: *FileCache, writer: *std.Io.Wr
         },
     }
     try writeString(writer, ")");
+}
+
+/// Serialize a regular file's contents.
+///
+/// Files at or below `read_cap` come from the cache, which
+/// usually already holds them. Larger ones are streamed in bounded chunks:
+/// NAR writes the length before the contents, and a source tree may hold
+/// blobs far above the read cap (a vendored tarball, a demo build), which
+/// must not be materialized in memory. Nix streams every file the same way,
+/// so the serialized bytes are unchanged.
+fn writeFileContents(files: *FileCache, writer: *std.Io.Writer, path: []const u8, read_cap: usize) !void {
+    const size = try files.fileSize(path);
+    if (size <= read_cap) {
+        try writeString(writer, try files.readFile(path));
+        return;
+    }
+
+    var length: [8]u8 = undefined;
+    std.mem.writeInt(u64, &length, size, .little);
+    try writer.writeAll(&length);
+
+    const io = files.io orelse return error.FileIoUnavailable;
+    var file = try files.openRead(path);
+    defer file.close(io);
+
+    var buffer: [64 * 1024]u8 = undefined;
+    var reader = file.readerStreaming(io, &buffer);
+    var remaining: u64 = size;
+    while (remaining > 0) {
+        const want: usize = @intCast(@min(remaining, buffer.len));
+        const chunk = try reader.interface.take(want);
+        if (chunk.len == 0) return error.UnexpectedEof;
+        try writer.writeAll(chunk);
+        remaining -= chunk.len;
+    }
+    // NAR pads every string to 8 bytes, exactly as `writeString` does.
+    const padding = (8 - size % 8) % 8;
+    try writer.splatByteAll(0, @intCast(padding));
 }
 
 fn writeString(writer: *std.Io.Writer, text: []const u8) !void {
@@ -244,4 +298,41 @@ test "streaming path digest matches retained canonical NAR bytes" {
     const digest = try hashPathDigest(testing.allocator, &files, path);
     const streaming_hash = std.fmt.bytesToHex(digest, .lower);
     try testing.expectEqualStrings(retained_hash, &streaming_hash);
+}
+
+test "files above the read cap stream byte-identically to the cached path" {
+    const testing = std.testing;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // 205 bytes: above the tiny cap used below, and not a multiple of 8, so the
+    // streamed path has to write both the length prefix and the NAR padding.
+    var payload: [205]u8 = undefined;
+    for (&payload, 0..) |*byte, index| byte.* = @intCast('a' + (index % 26));
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "big.bin", .data = &payload });
+
+    const cwd = try std.process.currentPathAlloc(testing.io, testing.allocator);
+    defer testing.allocator.free(cwd);
+    const path = try std.fs.path.resolve(testing.allocator, &.{
+        cwd,
+        ".zig-cache",
+        "tmp",
+        &tmp.sub_path,
+        "big.bin",
+    });
+    defer testing.allocator.free(path);
+
+    var files = FileCache.init(testing.allocator);
+    defer files.deinit();
+    files.setIo(testing.io);
+
+    // The cap decides memory, never bytes: a 64-byte cap routes the file through
+    // the streaming branch, and the result must equal the cached read's.
+    const streamed = try serializeCapped(testing.allocator, &files, path, null, null, 64);
+    defer testing.allocator.free(streamed);
+    const cached = try serializeReport(testing.allocator, &files, path, null, null);
+    defer testing.allocator.free(cached);
+
+    try testing.expectEqualSlices(u8, cached, streamed);
+    try testing.expect(std.mem.indexOf(u8, streamed, &payload) != null);
 }

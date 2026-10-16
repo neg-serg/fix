@@ -27,7 +27,11 @@ pub const FileCache = struct {
     /// lookup / insert, never across I/O.
     map_mu: sync.BlockingMutex = .{},
 
-    const max_read_bytes = 128 * 1024 * 1024;
+    /// The read cap: files above it are not materialized in memory. The NAR
+    /// serializer streams those instead (`nar.writeFileContents`), so a tree
+    /// holding a large blob (a vendored tarball, a demo build) still
+    /// serializes.
+    pub const max_read_bytes = 128 * 1024 * 1024;
 
     pub const FileKind = enum {
         regular,
@@ -301,6 +305,24 @@ pub const FileCache = struct {
         entry.exists = true;
         entry.kind = kind;
         return kind;
+    }
+
+    /// Size of the file at `path`, following a final symlink. The NAR writer
+    /// needs the length before the contents, so it stat's the file rather than
+    /// remembering a cached read.
+    pub fn fileSize(self: *FileCache, path: []const u8) !u64 {
+        const entry = try self.entryFor(path);
+        const io = self.io orelse return error.FileIoUnavailable;
+        const stat = try std.Io.Dir.cwd().statFile(io, entry.path, .{ .follow_symlinks = true });
+        return stat.size;
+    }
+
+    /// Open `path` for streaming reads — the NAR writer's large-file path.
+    /// The caller closes the returned handle.
+    pub fn openRead(self: *FileCache, path: []const u8) !std.Io.File {
+        const entry = try self.entryFor(path);
+        const io = self.io orelse return error.FileIoUnavailable;
+        return std.Io.Dir.cwd().openFile(io, entry.path, .{});
     }
 
     /// Trap: deliberately UNcached. Unlike `readFile`/`fileType`/`readDir`,
